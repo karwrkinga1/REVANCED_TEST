@@ -1,0 +1,213 @@
+name: Build and Release YouTube ReVanced Magisk Modules
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Runs daily at midnight
+  workflow_dispatch:
+
+jobs:
+  fetch_and_patch:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Define repository URLs and environment variables
+      - name: Define Repository URLs
+        run: |
+          echo "REVANCED_CLI_REPO=https://github.com/revanced/revanced-cli" >> $GITHUB_ENV
+          echo "REVANCED_PATCHES_REPO=https://github.com/revanced/revanced-patches" >> $GITHUB_ENV
+          echo "REVANCED_INTEGRATIONS_REPO=https://github.com/revanced/revanced-integrations" >> $GITHUB_ENV
+          echo "APKMIRROR_URL=https://www.apkmirror.com" >> $GITHUB_ENV
+          echo "RECOMMENDED_VERSION_URL=https://raw.githubusercontent.com/revanced/revanced-patches/main/applications/youtube/src/main/kotlin/app/revanced/patches/youtube/YoutubeKt.kt" >> $GITHUB_ENV
+
+      # Checkout the repository
+      - name: Checkout repository
+        uses: actions/checkout@v2
+
+      # Set up Java environment
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # Install necessary dependencies
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq wget curl zip
+
+      # Get the current recommended YouTube version from ReVanced
+      - name: Get Current Recommended YouTube Version
+        id: get_version
+        run: |
+          YOUTUBE_VERSION=$(curl -s ${{ env.RECOMMENDED_VERSION_URL }} | grep -oP '(?<=val recommendedVersion = ")([^"]+)')
+          echo "Recommended YouTube version: $YOUTUBE_VERSION"
+          echo "YOUTUBE_VERSION=$YOUTUBE_VERSION" >> $GITHUB_ENV
+
+      # Check if a new version is available
+      - name: Check for New Version
+        id: version_check
+        run: |
+          CURRENT_VERSION=$(git tag | grep 'youtube-v' | sort -V | tail -n 1 | sed 's/youtube-v//')
+          echo "Current recorded version: $CURRENT_VERSION"
+          
+          if [ "$CURRENT_VERSION" == "${{ env.YOUTUBE_VERSION }}" ]; then
+            echo "No new version available."
+            echo "::set-output name=should_build::false"
+          else
+            echo "New version available: ${{ env.YOUTUBE_VERSION }}"
+            echo "::set-output name=should_build::true"
+          fi
+
+      # Download the YouTube APK from APKMirror
+      - name: Download Recommended YouTube APK from APKMirror
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
+          SEARCH_URL="${{ env.APKMIRROR_URL }}/uploads/?q=youtube+${{ env.YOUTUBE_VERSION }}"
+          PAGE=$(curl -s "$SEARCH_URL" | grep -oP 'href="\K(/uploads.*?\.apk)' | head -n 1)
+          DOWNLOAD_URL="${{ env.APKMIRROR_URL }}$PAGE"
+          wget -O youtube.apk "$DOWNLOAD_URL"
+
+      # Clone the ReVanced CLI repository
+      - name: Clone ReVanced CLI
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
+          git clone ${{ env.REVANCED_CLI_REPO }}
+          cd revanced-cli
+          ./gradlew build
+          cd ..
+
+      # Clone the ReVanced Patches repository
+      - name: Clone ReVanced Patches
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
+          git clone ${{ env.REVANCED_PATCHES_REPO }}
+
+      # Clone the ReVanced Integrations repository
+      - name: Clone ReVanced Integrations
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
+          git clone ${{ env.REVANCED_INTEGRATIONS_REPO }}
+
+      # Build the ReVanced CLI
+      - name: Build ReVanced CLI
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
+          cd revanced-cli
+          ./gradlew build
+          cd ..
+
+      # Build the ReVanced Patches
+      - name: Build ReVanced Patches
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
+          cd revanced-patches
+          ./gradlew build
+          cd ..
+
+      # Patch the YouTube APK without GMS Core support for rooted devices
+      - name: Patch YouTube APK without GMS Core Support (Rooted)
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
+          java -jar revanced-cli/build/libs/revanced-cli.jar \
+            -a youtube.apk \
+            -c \
+            -o revanced-root.apk \
+            -b revanced-patches/build/libs/revanced-patches.jar \
+            -m revanced-integrations/build/libs/revanced-integrations.apk \
+            --install \
+            --without-gms
+
+      # Patch the YouTube APK with GMS Core support for non-rooted devices
+      - name: Patch YouTube APK with GMS Core Support (Non-Rooted)
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
+          java -jar revanced-cli/build/libs/revanced-cli.jar \
+            -a youtube.apk \
+            -c \
+            -o revanced-nonroot.apk \
+            -b revanced-patches/build/libs/revanced-patches.jar \
+            -m revanced-integrations/build/libs/revanced-integrations.apk \
+            --install
+
+      # Generate a changelog for the release
+      - name: Generate Changelog
+        id: generate_changelog
+        run: |
+          CHANGELOG=$(curl -s ${{ env.RECOMMENDED_VERSION_URL }} | grep -A10 "val recommendedVersion = \"${{ env.YOUTUBE_VERSION }}\"" | tail -n +2)
+          echo "CHANGELOG=$CHANGELOG" >> $GITHUB_ENV
+
+      # Create Magisk Module for Rooted Devices
+      - name: Create Magisk Module for Rooted Devices
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
+          mkdir -p magisk/youtube
+          cp revanced-root.apk magisk/youtube/base.apk
+
+          cat <<EOT >> magisk/module.prop
+          id=revanced-youtube
+          name=YouTube ReVanced
+          version=${{ env.YOUTUBE_VERSION }}
+          versionCode=${{ env.YOUTUBE_VERSION }}
+          author=ReVanced Team
+          description=YouTube ReVanced without GMS Core for Rooted Devices
+          EOT
+
+          echo "#!/system/bin/sh" > magisk/update-binary
+          chmod +x magisk/update-binary
+
+          cd magisk
+          zip -r ../YouTube_ReVanced_Rooted.zip .
+          cd ..
+
+      # Package Non-Rooted APK
+      - name: Package Non-Rooted APK
+        if: steps.version_check.outputs.should_build == 'true'
+        run: |
+          zip -r YouTube_ReVanced_NonRooted.zip revanced-nonroot.apk
+
+      # Create a new GitHub release
+      - name: Create GitHub Release
+        if: steps.version_check.outputs.should_build == 'true'
+        uses: actions/create-release@v1
+        with:
+          tag_name: "youtube-v${{ env.YOUTUBE_VERSION }}"
+          release_name: "YouTube ReVanced v${{ env.YOUTUBE_VERSION }}"
+          body: |
+            ### YouTube ReVanced v${{ env.YOUTUBE_VERSION }}
+
+            **Description:**
+            This release includes both the Magisk module for rooted devices and the APK for non-rooted devices.
+
+            **Rooted Version:**
+            - **Description:** This version is a Magisk module that replaces the original YouTube app with the ReVanced version. It does not require GMS Core support and is suitable for rooted devices.
+            
+            **Non-Rooted Version:**
+            - **Description:** This version is an APK that can be installed on non-rooted devices. It includes GMS Core support.
+
+            **Changelog:**
+            ${{ env.CHANGELOG }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Upload the Magisk module ZIP for rooted devices to the GitHub release
+      - name: Upload Magisk Module ZIP (Rooted) to Release
+        if: steps.version_check.outputs.should_build == 'true'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: YouTube_ReVanced_Rooted.zip
+          asset_name: youtube-revanced-${{ env.YOUTUBE_VERSION }}-rooted.zip
+          asset_content_type: application/zip
+
+      # Upload the Non-Rooted APK ZIP to the GitHub release
+      - name: Upload Non-Rooted APK ZIP to Release
+        if: steps.version_check.outputs.should_build == 'true'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: YouTube_ReVanced_NonRooted.zip
+          asset_name: youtube-revanced-${{ env.YOUTUBE_VERSION }}-nonrooted.zip
+          asset_content_type: application/zip
