@@ -190,7 +190,7 @@ jobs:
           draft: false
           prerelease: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RVXGITHUB_TOKEN }}
 
       # Upload the Magisk module ZIP for rooted devices to the GitHub release
       - name: Upload Magisk Module ZIP (Rooted) to Release
